@@ -1,0 +1,20 @@
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Large Datasets
+dataset/
+*.tif
+*.tiff
+*.tar.gz
+*.zip
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
