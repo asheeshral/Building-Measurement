@@ -108,25 +108,247 @@ def load_polygons_from_csv(csv_path, target_img_id):
     return polygons
 
 
-def extract_building_polygons_from_png_mask(image, min_area_px=15):
+def _is_binary_mask(image):
     """
-    Extracts building polygon footprint coordinates directly from image contours.
-    Supports binary (black & white) or colored building segmentation masks.
+    Heuristic: returns True when the image looks like a binary segmentation mask
+    (only two intensity clusters: near-0 and near-255).
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-    _, thresh = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
+    dark = float(np.sum(hist[:30]))
+    bright = float(np.sum(hist[225:]))
+    total = float(gray.size)
+    return (dark + bright) / total > 0.80
 
+
+def extract_building_polygons_from_png_mask(image, min_area_px=500):
+    """
+    Legacy entry-point — routes to the correct detector based on image type.
+    Binary segmentation masks use the fast threshold path; real aerial/satellite
+    photos (JPG, RGB GeoTIFF) use the full multi-strategy CV pipeline.
+    """
+    if _is_binary_mask(image):
+        # ---- Binary-mask fast path (original behaviour) -----------------------
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        _, thresh = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        polygons = []
+        for cnt in contours:
+            if cv2.contourArea(cnt) >= 15:
+                epsilon = 0.01 * cv2.arcLength(cnt, True)
+                approx = cv2.approxPolyDP(cnt, epsilon, True)
+                coords = [(float(pt[0][0]), float(pt[0][1])) for pt in approx]
+                if len(coords) >= 3:
+                    if coords[0] != coords[-1]:
+                        coords.append(coords[0])
+                    polygons.append(coords)
+        return polygons
+
+    # ---- Real aerial / satellite photo path -----------------------------------
+    return detect_buildings_from_aerial_image(image, min_area_px=min_area_px)
+
+
+def detect_buildings_from_aerial_image(image, min_area_px=None):
+    """
+    Multi-strategy, image-size-adaptive building detector for real aerial /
+    satellite photographs (JPG, RGB GeoTIFF).
+
+    Pipeline:
+      A. CLAHE-enhanced Otsu threshold   — primary detection
+      B. Adaptive threshold              — catches low-contrast rooftops
+      C. Canny edges (scale-adaptive)    — outlines for large buildings
+      D. HSV suppression of sky/veg      — removes false positives
+      Merge A+B+C, suppress D, clean up with morphology, then separate
+      touching blobs via watershed.  Filter by area, aspect, solidity.
+    """
+    if image is None:
+        return []
+
+    img_h, img_w = image.shape[:2]
+    img_area   = img_h * img_w
+    short_side = min(img_h, img_w)
+
+    # ------------------------------------------------------------------ #
+    # Scale-adaptive morphological kernel sizes (proportional to image)
+    #   k_small : ~1 % of short side, minimum 3
+    #   k_close : ~3 % for edge-closing, max 21 on large images
+    # ------------------------------------------------------------------ #
+    k_small = max(3, int(short_side * 0.010) | 1)   # ensure odd
+    k_close = max(3, int(short_side * 0.025) | 1)
+    k_fill  = max(3, int(short_side * 0.015) | 1)
+
+    # Adaptive min / max area bounds (scale with image resolution)
+    if min_area_px is None:
+        min_area_px = max(50, int(img_area * 0.0006))   # ≥0.06 % of image
+    max_area_px = int(img_area * 0.55)                   # ≤55 % of image
+
+    # ------------------------------------------------------------------ #
+    # 0. Preprocessing
+    # ------------------------------------------------------------------ #
+    bgr = image.copy()
+    if bgr.dtype != np.uint8:
+        bgr = np.clip(bgr, 0, 255).astype(np.uint8)
+
+    blur_k = max(3, (k_small // 2) * 2 - 1)    # odd ≤ k_small
+    blurred = cv2.GaussianBlur(bgr, (blur_k, blur_k), 0.8)
+    gray    = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+
+    tile = max(4, short_side // 32)
+    clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(tile, tile))
+    enhanced = clahe.apply(gray)
+
+    hsv  = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    v_ch = hsv[:, :, 2]
+
+    # ------------------------------------------------------------------ #
+    # Strategy A — Otsu on CLAHE-enhanced greyscale
+    # ------------------------------------------------------------------ #
+    _, mask_a = cv2.threshold(enhanced, 0, 255,
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # ------------------------------------------------------------------ #
+    # Strategy B — Adaptive threshold (local mean) for low-contrast areas
+    # ------------------------------------------------------------------ #
+    block = max(11, (short_side // 12) | 1)   # odd, scales with image
+    mask_b = cv2.adaptiveThreshold(enhanced, 255,
+                                   cv2.ADAPTIVE_THRESH_MEAN_C,
+                                   cv2.THRESH_BINARY, block, 4)
+
+    # ------------------------------------------------------------------ #
+    # Strategy C — Canny edges closed into blobs (scale-adaptive kernel)
+    # ------------------------------------------------------------------ #
+    med_val = float(np.median(enhanced))
+    canny_lo = int(max(10, med_val * 0.40))
+    canny_hi = int(min(240, med_val * 1.20))
+    edges  = cv2.Canny(enhanced, canny_lo, canny_hi)
+    close_el = cv2.getStructuringElement(cv2.MORPH_RECT, (k_close, k_close))
+    mask_c   = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_el)
+
+    # ------------------------------------------------------------------ #
+    # Strategy D — HSV suppression: vegetation, sky, deep shadows
+    # ------------------------------------------------------------------ #
+    veg_mask    = cv2.inRange(hsv, np.array([30, 35, 35]),  np.array([85,  255, 255]))
+    sky_mask    = cv2.inRange(hsv, np.array([90, 15, 150]), np.array([130, 255, 255]))
+    shadow_mask = (v_ch < 35).astype(np.uint8) * 255
+
+    suppress = cv2.bitwise_or(veg_mask, sky_mask)
+    suppress = cv2.bitwise_or(suppress, shadow_mask)
+    sup_el   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_small, k_small))
+    suppress = cv2.dilate(suppress, sup_el)
+
+    # ------------------------------------------------------------------ #
+    # Merge A + B + C, then suppress D
+    # ------------------------------------------------------------------ #
+    combined = cv2.bitwise_or(mask_a, mask_b)
+    combined = cv2.bitwise_or(combined, mask_c)
+    combined = cv2.bitwise_and(combined, cv2.bitwise_not(suppress))
+
+    # ------------------------------------------------------------------ #
+    # Morphological cleanup
+    # ------------------------------------------------------------------ #
+    fill_el = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_fill, k_fill))
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, fill_el)
+    open_el  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_small, k_small))
+    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN,  open_el)
+
+    # ------------------------------------------------------------------ #
+    # Watershed separation of touching blobs
+    # ------------------------------------------------------------------ #
+    dist      = cv2.distanceTransform(combined, cv2.DIST_L2, 5)
+    dist_norm = cv2.normalize(dist, None, 0, 1.0, cv2.NORM_MINMAX)
+
+    fg_thresh = 0.35   # pixels clearly inside a building
+    _, sure_fg = cv2.threshold(dist_norm, fg_thresh, 1.0, cv2.THRESH_BINARY)
+    sure_fg    = (sure_fg * 255).astype(np.uint8)
+
+    sure_bg = cv2.dilate(combined,
+                         cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+                         iterations=3)
+    unknown = cv2.subtract(sure_bg, sure_fg)
+
+    n_labels, markers = cv2.connectedComponents(sure_fg)
+    markers = markers + 1
+    markers[unknown == 255] = 0
+
+    ws_input = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    cv2.watershed(ws_input, markers)
+
+    # ------------------------------------------------------------------ #
+    # Helper: validate & convert a single contour to polygon coords
+    # ------------------------------------------------------------------ #
+    def _contour_to_polygon(cnt):
+        area = cv2.contourArea(cnt)
+        if area < min_area_px or area > max_area_px:
+            return None
+        rect   = cv2.minAreaRect(cnt)
+        s1, s2 = rect[1]
+        if min(s1, s2) < 2:
+            return None
+        if max(s1, s2) / min(s1, s2) > 25.0:
+            return None
+        hull      = cv2.convexHull(cnt)
+        hull_area = cv2.contourArea(hull)
+        if hull_area < 1 or area / hull_area < 0.28:
+            return None
+        eps    = 0.012 * cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, eps, True)
+        coords = [(float(p[0][0]), float(p[0][1])) for p in approx]
+        if len(coords) < 3:
+            return None
+        if coords[0] != coords[-1]:
+            coords.append(coords[0])
+        return coords
+
+    # ------------------------------------------------------------------ #
+    # Extract one polygon per watershed label
+    # ------------------------------------------------------------------ #
     polygons = []
-    for cnt in contours:
-        if cv2.contourArea(cnt) >= min_area_px:
-            epsilon = 0.01 * cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, epsilon, True)
-            coords = [(float(pt[0][0]), float(pt[0][1])) for pt in approx]
-            if len(coords) >= 3:
-                if coords[0] != coords[-1]:
-                    coords.append(coords[0])
-                polygons.append(coords)
+    for label in range(2, n_labels + 1):
+        lmask = np.where(markers == label, 255, 0).astype(np.uint8)
+        cnts, _ = cv2.findContours(lmask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in cnts:
+            poly = _contour_to_polygon(cnt)
+            if poly:
+                polygons.append(poly)
+
+    # ------------------------------------------------------------------ #
+    # Fallback: direct contours from combined mask (no watershed)
+    # ------------------------------------------------------------------ #
+    if not polygons:
+        cnts, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in cnts:
+            poly = _contour_to_polygon(cnt)
+            if poly:
+                polygons.append(poly)
+
+    # ------------------------------------------------------------------ #
+    # Additional pass: also try contours on the raw Otsu mask alone
+    # (catches buildings missed when combined mask over-merged regions)
+    # ------------------------------------------------------------------ #
+    seen_centers = set()
+    for poly in polygons:
+        pts = np.array(poly, dtype=np.float32)
+        cx, cy = int(pts[:, 0].mean()), int(pts[:, 1].mean())
+        seen_centers.add((cx // 10, cy // 10))
+
+    fill_a = cv2.morphologyEx(mask_a, cv2.MORPH_CLOSE, fill_el)
+    fill_a = cv2.morphologyEx(fill_a, cv2.MORPH_OPEN,  open_el)
+    extra_cnts, _ = cv2.findContours(fill_a, cv2.RETR_EXTERNAL,
+                                     cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in extra_cnts:
+        poly = _contour_to_polygon(cnt)
+        if poly:
+            pts = np.array(poly, dtype=np.float32)
+            cx, cy = int(pts[:, 0].mean()), int(pts[:, 1].mean())
+            key = (cx // 10, cy // 10)
+            if key not in seen_centers:
+                seen_centers.add(key)
+                polygons.append(poly)
+
+    print(f"[Detector]: Found {len(polygons)} building regions "
+          f"(min={min_area_px} px², max={max_area_px} px²)")
     return polygons
 
 
@@ -435,8 +657,11 @@ def save_image(path, img):
 
 def main():
     parser = argparse.ArgumentParser(description="SpaceNet 2 Interactive 3D Building Measurement System")
-    parser.add_argument("--image", type=str, default=None, help="Path to satellite image (.tif, .png, .jpg)")
-    parser.add_argument("--no-gui", action="store_true", help="Disable GUI file selection dialog")
+    parser.add_argument("--image",  type=str,   default=None,  help="Path to satellite image (.tif, .png, .jpg)")
+    parser.add_argument("--no-gui", action="store_true",       help="Disable GUI file selection dialog")
+    parser.add_argument("--gsd",    type=float, default=None,
+                        help="Ground sample distance in metres/pixel. "
+                             "Default: 0.30 for TIFF, 0.50 auto-estimated for JPG/PNG.")
     args = parser.parse_args()
 
     start_total_time = time.perf_counter()
@@ -481,6 +706,29 @@ def main():
 
     gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
+    # ---- Resolve Ground Sample Distance ----------------------------------------
+    ext_lower = os.path.splitext(img_path)[1].lower()
+    if args.gsd is not None:
+        gsd = args.gsd
+        print(f"[GSD]: Using user-specified {gsd:.4f} m/px")
+    elif ext_lower in ('.tif', '.tiff'):
+        gsd = 0.30          # SpaceNet 2 GeoTIFF native resolution
+        print(f"[GSD]: TIFF image detected — using {gsd:.2f} m/px (SpaceNet default)")
+    else:
+        # Heuristic for aerial JPG: larger images → higher altitude → coarser GSD
+        img_h, img_w = image.shape[:2]
+        mp = (img_h * img_w) / 1_000_000.0
+        if mp >= 8:
+            gsd = 1.20
+        elif mp >= 4:
+            gsd = 0.80
+        elif mp >= 1:
+            gsd = 0.50
+        else:
+            gsd = 0.30
+        print(f"[GSD]: JPG image ({img_h}x{img_w}, {mp:.1f} MP) — "
+              f"auto-estimated {gsd:.2f} m/px. Override with --gsd <value>.")
+
     footprints_img = image.copy()
     for poly in polygons:
         poly_pts = np.array(poly, dtype=np.int32).reshape((-1, 1, 2))
@@ -494,9 +742,9 @@ def main():
 
     for idx, poly in enumerate(polygons, 1):
         dim = calculate_building_dimensions(
-            poly, 
+            poly,
             gray_image=gray_image,
-            gsd_meters_per_pixel=0.30,
+            gsd_meters_per_pixel=gsd,
             solar_elevation_deg=52.0,
             solar_azimuth_deg=135.0,
             floor_height_m=3.0
@@ -540,7 +788,7 @@ def main():
     axes[0, 1].axis("off")
 
     axes[1, 0].imshow(cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB))
-    axes[1, 0].set_title(f"3. 3D Measurement (L x W x H + Extrusions)\n(GSD: 0.30m/px, 1 Fl = 3.0m)", fontsize=12, fontweight='bold')
+    axes[1, 0].set_title(f"3. 3D Measurement (L x W x H + Extrusions)\n(GSD: {gsd:.2f}m/px, 1 Fl = 3.0m)", fontsize=12, fontweight='bold')
     axes[1, 0].axis("off")
 
     indices = np.arange(1, len(building_metrics) + 1)
