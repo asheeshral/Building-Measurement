@@ -4,6 +4,7 @@ import os
 import sys
 import math
 import time
+import argparse
 import tifffile as tiff
 import numpy as np
 import matplotlib.pyplot as plt
@@ -16,49 +17,185 @@ if hasattr(sys.stdout, 'reconfigure'):
     except Exception:
         pass
 
-def load_sample_building(csv_path, img_dir, target_img_id=None):
+
+def select_image_file_dialog(initial_dir=None):
     """
-    Loads building footprints from CSV and corresponding satellite TIFF image efficiently.
-    Pre-converts polygons into Shapely objects and float32 coordinate arrays.
+    Opens a native Windows Explorer file dialog allowing the user to select any satellite image.
+    Returns selected file path or None if cancelled.
     """
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
 
-    image_polygons = {}
-    with open(csv_path, mode='r') as infile:
-        reader = csv.DictReader(infile)
-        for row in reader:
-            img_id = row['ImageId']
-            pix_wkt = row['PolygonWKT_Pix']
-            
-            if pix_wkt != 'POLYGON EMPTY':
-                geom = wkt.loads(pix_wkt)
-                coords = [(pt[0], pt[1]) for pt in geom.exterior.coords]
-                if img_id not in image_polygons:
-                    image_polygons[img_id] = []
-                image_polygons[img_id].append(coords)
+        root = tk.Tk()
+        root.withdraw()  # Hide root window
+        root.attributes('-topmost', True)  # Bring dialog to front
 
-    if target_img_id is None or target_img_id not in image_polygons:
-        for img_id, polys in image_polygons.items():
-            if len(polys) >= 5:
-                target_img_id = img_id
-                break
+        if initial_dir is None or not os.path.exists(initial_dir):
+            initial_dir = os.getcwd()
 
-    img_filename = f"RGB-PanSharpen_{target_img_id}.tif"
-    img_path = os.path.join(img_dir, img_filename)
+        file_path = filedialog.askopenfilename(
+            title="Select Satellite Image for 3D Building Measurement",
+            initialdir=initial_dir,
+            filetypes=[
+                ("Supported Images (*.tif, *.png, *.jpg)", "*.tif;*.tiff;*.png;*.jpg;*.jpeg"),
+                ("GeoTIFF Images (*.tif, *.tiff)", "*.tif;*.tiff"),
+                ("PNG Images (*.png)", "*.png"),
+                ("JPEG Images (*.jpg, *.jpeg)", "*.jpg;*.jpeg"),
+                ("All Files (*.*)", "*.*")
+            ]
+        )
+        root.destroy()
+        return file_path if file_path else None
+    except Exception as e:
+        print(f"[GUI File Dialog Notice]: {e}")
+        return None
 
+
+def load_image_file(img_path):
+    """
+    Universally loads satellite or aerial images supporting .png, .jpg, .jpeg, .tif, .tiff formats.
+    """
     if not os.path.exists(img_path):
-        raise FileNotFoundError(f"Satellite image file not found: {img_path}")
+        raise FileNotFoundError(f"Image file not found: {img_path}")
 
-    image = tiff.imread(img_path)
+    ext = os.path.splitext(img_path)[1].lower()
+    if ext in ['.tif', '.tiff']:
+        image = tiff.imread(img_path)
+    else:
+        image = cv2.imread(img_path)
+
+    if image is None:
+        raise ValueError(f"Failed to read image at: {img_path}")
 
     if image.dtype != np.uint8:
         image = image.astype(np.uint8)
 
     if len(image.shape) == 3:
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        if ext in ['.tif', '.tiff']:
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-    return image, image_polygons[target_img_id], img_path, target_img_id
+    return image
+
+
+def extract_image_id_from_path(img_path):
+    """
+    Extracts SpaceNet ImageId (e.g. 'AOI_3_Paris_img123') from filename.
+    """
+    basename = os.path.splitext(os.path.basename(img_path))[0]
+    if basename.startswith("RGB-PanSharpen_"):
+        return basename.replace("RGB-PanSharpen_", "")
+    return basename
+
+
+def load_polygons_from_csv(csv_path, target_img_id):
+    """
+    Finds building footprint polygons for target_img_id inside CSV file.
+    """
+    if not os.path.exists(csv_path):
+        return []
+
+    polygons = []
+    with open(csv_path, mode='r') as infile:
+        reader = csv.DictReader(infile)
+        for row in reader:
+            if row['ImageId'] == target_img_id:
+                pix_wkt = row['PolygonWKT_Pix']
+                if pix_wkt != 'POLYGON EMPTY':
+                    geom = wkt.loads(pix_wkt)
+                    coords = [(pt[0], pt[1]) for pt in geom.exterior.coords]
+                    polygons.append(coords)
+    return polygons
+
+
+def extract_building_polygons_from_png_mask(image, min_area_px=15):
+    """
+    Extracts building polygon footprint coordinates directly from image contours.
+    Supports binary (black & white) or colored building segmentation masks.
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    _, thresh = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    polygons = []
+    for cnt in contours:
+        if cv2.contourArea(cnt) >= min_area_px:
+            epsilon = 0.01 * cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, epsilon, True)
+            coords = [(float(pt[0][0]), float(pt[0][1])) for pt in approx]
+            if len(coords) >= 3:
+                if coords[0] != coords[-1]:
+                    coords.append(coords[0])
+                polygons.append(coords)
+    return polygons
+
+
+def load_building_data(csv_path, default_img_dir, selected_img_path=None):
+    """
+    Dynamically loads image and building footprints based on user selection or defaults.
+    """
+    image = None
+    polygons = []
+    img_id = "Custom_Image"
+
+    if selected_img_path and os.path.exists(selected_img_path):
+        img_path = selected_img_path
+        img_id = extract_image_id_from_path(img_path)
+        image = load_image_file(img_path)
+        
+        # Try loading WKT footprints from CSV
+        polygons = load_polygons_from_csv(csv_path, img_id)
+        if not polygons:
+            # Fallback to contour extraction if CSV entry not found
+            print(f"[Notice]: No CSV footprint entry found for ID '{img_id}'. Extracting contours automatically...")
+            polygons = extract_building_polygons_from_png_mask(image)
+
+        return image, polygons, img_path, img_id
+
+    # Fallback default: find an image in default_img_dir with at least 5 buildings
+    if os.path.exists(csv_path):
+        image_polygons = {}
+        with open(csv_path, mode='r') as infile:
+            reader = csv.DictReader(infile)
+            for row in reader:
+                i_id = row['ImageId']
+                pix_wkt = row['PolygonWKT_Pix']
+                if pix_wkt != 'POLYGON EMPTY':
+                    geom = wkt.loads(pix_wkt)
+                    coords = [(pt[0], pt[1]) for pt in geom.exterior.coords]
+                    if i_id not in image_polygons:
+                        image_polygons[i_id] = []
+                    image_polygons[i_id].append(coords)
+
+        for i_id, polys in image_polygons.items():
+            if len(polys) >= 5:
+                img_id = i_id
+                polygons = polys
+                break
+
+    # Look for candidate file matching default img_id
+    img_path = None
+    for ext in ['.tif', '.tiff', '.png', '.jpg', '.jpeg']:
+        cand = os.path.join(default_img_dir, f"RGB-PanSharpen_{img_id}{ext}")
+        if os.path.exists(cand):
+            img_path = cand
+            break
+
+    if img_path is None and os.path.exists(default_img_dir):
+        files = [os.path.join(default_img_dir, f) for f in os.listdir(default_img_dir) if f.endswith(('.tif', '.tiff', '.png', '.jpg'))]
+        if files:
+            img_path = files[0]
+            img_id = extract_image_id_from_path(img_path)
+            polygons = load_polygons_from_csv(csv_path, img_id)
+
+    if img_path is None or not os.path.exists(img_path):
+        raise FileNotFoundError("No satellite image file found. Please select a valid .tif or .png image.")
+
+    image = load_image_file(img_path)
+    if not polygons:
+        polygons = extract_building_polygons_from_png_mask(image)
+
+    return image, polygons, img_path, img_id
 
 
 def estimate_shadow_length(gray_image, polygon_coords, solar_azimuth_deg=135.0, max_search_px=50):
@@ -72,13 +209,10 @@ def estimate_shadow_length(gray_image, polygon_coords, solar_azimuth_deg=135.0, 
     h_img, w_img = gray_image.shape[:2]
 
     # Geospatial Solar Vector Math (Azimuth measured clockwise from North)
-    # Solar direction (dx_sun, dy_sun) in pixel space (+X = East, +Y = South):
     rad = math.radians(solar_azimuth_deg)
-    # Shadow cast vector points OPPOSITE to solar position (-sun vector):
     dx_shadow = -math.sin(rad)
     dy_shadow = math.cos(rad)
 
-    # 1. Local Bounding Box Sub-Crop Optimization (reduces array operations by ~98%)
     pts_arr = np.array(polygon_coords, dtype=np.float32)
     min_x = max(0, int(np.min(pts_arr[:, 0])) - max_search_px)
     max_x = min(w_img, int(np.max(pts_arr[:, 0])) + max_search_px)
@@ -91,11 +225,9 @@ def estimate_shadow_length(gray_image, polygon_coords, solar_azimuth_deg=135.0, 
     if crop_h <= 0 or crop_w <= 0:
         return 0.0
 
-    # Offset polygon coordinates into cropped space
     local_pts = pts_arr - np.array([min_x, min_y], dtype=np.float32)
     int_local_pts = np.int32(local_pts)
 
-    # 2. Local Footprint Mask
     local_mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
     cv2.fillPoly(local_mask, [int_local_pts], 255)
 
@@ -107,7 +239,6 @@ def estimate_shadow_length(gray_image, polygon_coords, solar_azimuth_deg=135.0, 
     shadow_threshold = min(mean_roof_val * 0.72, 105.0)
 
     shadow_lengths = []
-    # Sub-sample boundary vertices for speed & robustness
     step_stride = max(1, len(local_pts) // 16)
     for pt in local_pts[::step_stride]:
         x0, y0 = pt[0], pt[1]
@@ -117,7 +248,7 @@ def estimate_shadow_length(gray_image, polygon_coords, solar_azimuth_deg=135.0, 
             sy = int(round(y0 + dy_shadow * step))
             if 0 <= sx < crop_w and 0 <= sy < crop_h:
                 if local_mask[sy, sx] == 255:
-                    continue  # inside building footprint
+                    continue
                 val = crop_gray[sy, sx]
                 if val < shadow_threshold:
                     length = step
@@ -130,7 +261,6 @@ def estimate_shadow_length(gray_image, polygon_coords, solar_azimuth_deg=135.0, 
             shadow_lengths.append(length)
 
     if shadow_lengths:
-        # Use 75th percentile to robustly filter noise/occlusions
         return float(np.percentile(shadow_lengths, 75))
     return 0.0
 
@@ -148,18 +278,15 @@ def calculate_building_dimensions(
     """
     pts = np.array(polygon_coords, dtype=np.float32).reshape((-1, 1, 2))
 
-    # 1. Minimum Area Oriented Bounding Rectangle
     rect = cv2.minAreaRect(pts)
     center, (side1, side2), angle = rect
 
-    # Length is always the longer side, Width the shorter side
     length_px = max(side1, side2)
     width_px = min(side1, side2)
 
     length_m = length_px * gsd_meters_per_pixel
     width_m = width_px * gsd_meters_per_pixel
 
-    # 2. Exact Footprint Area using Shapely
     polygon = Polygon(polygon_coords)
     area_px = polygon.area
     area_m = area_px * (gsd_meters_per_pixel ** 2)
@@ -167,7 +294,6 @@ def calculate_building_dimensions(
     box_pts = cv2.boxPoints(rect)
     box_pts = np.int32(box_pts)
 
-    # 3. Physics-based Shadow Height Estimation
     shadow_px = estimate_shadow_length(
         gray_image, 
         polygon_coords, 
@@ -177,19 +303,15 @@ def calculate_building_dimensions(
     elevation_rad = math.radians(solar_elevation_deg)
     height_shadow_m = shadow_m * math.tan(elevation_rad) if shadow_px > 0 else 0.0
 
-    # 4. Urban Morphological Structural Height Model
-    # Urban building story count correlates with footprint area & aspect ratio
     aspect_ratio = length_m / max(width_m, 0.1)
     base_floors = max(1.0, 0.82 * math.pow(area_m, 0.33) + 0.25 * aspect_ratio)
     height_structural_m = base_floors * floor_height_m
 
-    # 5. Hybrid Height Fusion (Weighted Physics + Morphological Model)
     if height_shadow_m > 2.0:
         height_m = 0.60 * height_shadow_m + 0.40 * height_structural_m
     else:
         height_m = height_structural_m
 
-    # Compute derived metrics
     height_px = height_m / gsd_meters_per_pixel
     floors = max(1, int(round(height_m / floor_height_m)))
     volume_m3 = area_m * height_m
@@ -221,19 +343,19 @@ def draw_building_measurements(
     draw_3d_wireframe=True
 ):
     """
-    Fast rendering of 2D footprint, oriented bounding box, 3D wireframe extrusions, and text cards.
+    Renders 2D footprint, oriented bounding box, 3D wireframe extrusions, and text cards.
     """
     annotated = image.copy()
     
-    # 1. 2D Ground Footprint Polygon (Green)
+    # 2D Ground Footprint Polygon (Green)
     poly_pts = np.array(polygon_coords, dtype=np.int32).reshape((-1, 1, 2))
     cv2.polylines(annotated, [poly_pts], isClosed=True, color=(0, 255, 0), thickness=2)
 
-    # 2. Minimum Area Bounding Box (Cyan)
+    # Minimum Area Bounding Box (Cyan)
     box_pts = measurement_info['box_points']
     cv2.polylines(annotated, [box_pts], isClosed=True, color=(255, 255, 0), thickness=2)
 
-    # 3. 3D Wireframe Extrusion Projection (Magenta & Hot Pink)
+    # 3D Wireframe Extrusion Projection (Magenta & Hot Pink)
     if draw_3d_wireframe:
         height_px = measurement_info['height_px']
         offset_x = int(round(-0.45 * height_px))
@@ -241,7 +363,6 @@ def draw_building_measurements(
 
         top_box_pts = box_pts + np.array([offset_x, offset_y], dtype=np.int32)
 
-        # Draw vertical corner pillars
         for pt_ground, pt_top in zip(box_pts, top_box_pts):
             cv2.line(
                 annotated, 
@@ -252,7 +373,6 @@ def draw_building_measurements(
                 lineType=cv2.LINE_AA
             )
 
-        # Draw roof wireframe rectangle
         cv2.polylines(
             annotated, 
             [top_box_pts], 
@@ -262,7 +382,6 @@ def draw_building_measurements(
             lineType=cv2.LINE_AA
         )
 
-    # 4. Measurement Text Card
     l_m = measurement_info['length_m']
     w_m = measurement_info['width_m']
     h_m = measurement_info['height_m']
@@ -279,7 +398,6 @@ def draw_building_measurements(
     text_x = max(5, cx - text_w // 2)
     text_y = max(18, cy - 8)
 
-    # Background card
     cv2.rectangle(
         annotated, 
         (text_x - 3, text_y - text_h - 4), 
@@ -316,6 +434,11 @@ def save_image(path, img):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="SpaceNet 2 Interactive 3D Building Measurement System")
+    parser.add_argument("--image", type=str, default=None, help="Path to satellite image (.tif, .png, .jpg)")
+    parser.add_argument("--no-gui", action="store_true", help="Disable GUI file selection dialog")
+    args = parser.parse_args()
+
     start_total_time = time.perf_counter()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -326,30 +449,38 @@ def main():
     csv_path = os.path.join(base_dir, r"summaryData\AOI_3_Paris_Train_Building_Solutions.csv")
     img_dir = os.path.join(base_dir, r"RGB-PanSharpen")
     
+    selected_img_path = args.image
+
+    # Open Windows File Dialog if no direct image argument is provided and GUI is enabled
+    if selected_img_path is None and not args.no_gui and sys.stdin.isatty():
+        print("Opening Windows Explorer file dialog to select a satellite image...")
+        selected_img_path = select_image_file_dialog(initial_dir=img_dir if os.path.exists(img_dir) else script_dir)
+        if selected_img_path:
+            print(f"[User Selected Image]: {selected_img_path}")
+        else:
+            print("[File Selection Notice]: No file selected from dialog. Loading default sample image...")
+
     original_sat_path = os.path.join(images_dir, "original_satellite_image.png")
     input_path = os.path.join(images_dir, "measured_building_input.png")
     output_path = os.path.join(images_dir, "measured_building_output.png")
     plot_path = os.path.join(images_dir, "building_measurement_plot.png")
 
     print("==================================================")
-    print("SpaceNet 2 Building 3D Dimension Measurement")
+    print("SpaceNet 2 Dynamic 3D Building Measurement")
     print(" (Length, Width, Height, Floors & Volume)")
     print("==================================================")
 
     t0 = time.perf_counter()
-    image, polygons, img_path, img_id = load_sample_building(csv_path, img_dir)
+    image, polygons, img_path, img_id = load_building_data(csv_path, img_dir, selected_img_path=selected_img_path)
     t_load = (time.perf_counter() - t0) * 1000
     print(f"[Loaded Image & Polygons in {t_load:.1f}ms]: {os.path.basename(img_path)} (ID: {img_id})")
     print(f"[Building Count]: {len(polygons)} building footprints found.")
 
-    # Save original satellite image explicitly
     save_image(original_sat_path, image)
     save_image(input_path, image)
 
-    # Pre-compute single grayscale image once for fast shadow analysis
     gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # Draw footprints ground-truth overlay
     footprints_img = image.copy()
     for poly in polygons:
         poly_pts = np.array(poly, dtype=np.int32).reshape((-1, 1, 2))
@@ -371,7 +502,6 @@ def main():
             floor_height_m=3.0
         )
         
-        # Skip tiny annotation artifacts
         if dim['area_m'] < 1.0:
             continue
 
@@ -399,25 +529,20 @@ def main():
     save_image(output_path, annotated_img)
     print(f"[Saved Annotated Output Image]: {output_path}")
 
-    # 4-Panel Multi-Plot Comparison & Analytical Visualization
     fig, axes = plt.subplots(2, 2, figsize=(18, 14))
 
-    # Panel 1: Original Satellite Image
     axes[0, 0].imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
     axes[0, 0].set_title(f"1. Original Satellite Image\n({img_id})", fontsize=12, fontweight='bold')
     axes[0, 0].axis("off")
 
-    # Panel 2: Ground Footprints
     axes[0, 1].imshow(cv2.cvtColor(footprints_img, cv2.COLOR_BGR2RGB))
-    axes[0, 1].set_title(f"2. Building Ground Footprints\n(Green WKT Polygons)", fontsize=12, fontweight='bold')
+    axes[0, 1].set_title(f"2. Building Ground Footprints\n(Green Polygons)", fontsize=12, fontweight='bold')
     axes[0, 1].axis("off")
 
-    # Panel 3: 3D Dimensional Measurement (Length x Width x Height Wireframe)
     axes[1, 0].imshow(cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB))
     axes[1, 0].set_title(f"3. 3D Measurement (L x W x H + Extrusions)\n(GSD: 0.30m/px, 1 Fl = 3.0m)", fontsize=12, fontweight='bold')
     axes[1, 0].axis("off")
 
-    # Panel 4: Heights & Volume Analytical Bar Chart
     indices = np.arange(1, len(building_metrics) + 1)
     heights = [d['height_m'] for d in building_metrics]
     volumes = [d['volume_m3'] for d in building_metrics]
