@@ -55,6 +55,8 @@ def select_image_file_dialog(initial_dir=None):
 def load_image_file(img_path):
     """
     Universally loads satellite or aerial images supporting .png, .jpg, .jpeg, .tif, .tiff formats.
+    Robustly converts 16-bit GeoTIFF imagery to 8-bit RGB using percentile normalization,
+    preventing uint8 wrapping artifacts.
     """
     if not os.path.exists(img_path):
         raise FileNotFoundError(f"Image file not found: {img_path}")
@@ -68,334 +70,327 @@ def load_image_file(img_path):
     if image is None:
         raise ValueError(f"Failed to read image at: {img_path}")
 
+    # Handle multi-spectral imagery (take first 3 bands if > 3 channels)
+    if len(image.shape) == 3 and image.shape[2] > 3:
+        image = image[:, :, :3]
+
+    # Convert 16-bit or float images safely without modulo truncation
     if image.dtype != np.uint8:
-        image = image.astype(np.uint8)
+        if image.max() > 255:
+            p_lo, p_hi = np.percentile(image, (1, 99))
+            if p_hi > p_lo:
+                image = np.clip((image.astype(np.float32) - p_lo) / (p_hi - p_lo) * 255.0, 0, 255).astype(np.uint8)
+            else:
+                image = (image.astype(np.float32) / image.max() * 255.0).astype(np.uint8)
+        else:
+            image = image.astype(np.uint8)
 
     if len(image.shape) == 3:
         if ext in ['.tif', '.tiff']:
             image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    elif len(image.shape) == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
 
     return image
 
 
 def extract_image_id_from_path(img_path):
     """
-    Extracts SpaceNet ImageId (e.g. 'AOI_3_Paris_img123') from filename.
+    Extracts SpaceNet ImageId (e.g. 'AOI_3_Paris_img739') from filename or path.
+    Handles filenames like:
+      - 'RGB-PanSharpen_AOI_3_Paris_img739.tif' -> 'AOI_3_Paris_img739'
+      - 'MS_AOI_3_Paris_img739.tif' -> 'AOI_3_Paris_img739'
+      - 'AOI_3_Paris_img739.png' -> 'AOI_3_Paris_img739'
     """
-    basename = os.path.splitext(os.path.basename(img_path))[0]
-    if basename.startswith("RGB-PanSharpen_"):
-        return basename.replace("RGB-PanSharpen_", "")
-    return basename
+    filename = os.path.basename(img_path)
+    name = os.path.splitext(filename)[0]
+
+    prefixes = [
+        "RGB-PanSharpen_",
+        "PAN_",
+        "MS_",
+        "3Band_",
+        "RGB_"
+    ]
+    for p in prefixes:
+        if name.startswith(p):
+            name = name[len(p):]
+            break
+
+    return name
+
+
+def find_csv_file(csv_path, script_dir):
+    """
+    Locates the SpaceNet ground-truth CSV file reliably across directory structures.
+    """
+    candidates = [
+        csv_path,
+        os.path.join(script_dir, "dataset", "AOI_3_Paris_Train", "AOI_3_Paris_Train", "summaryData", "AOI_3_Paris_Train_Building_Solutions.csv"),
+        os.path.join(script_dir, "dataset", "summaryData", "AOI_3_Paris_Train_Building_Solutions.csv"),
+        os.path.join(script_dir, "AOI_3_Paris_Train_Building_Solutions.csv")
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+
+    # Walk workspace directory as fallback
+    for root, _, files in os.walk(script_dir):
+        for f in files:
+            if f.endswith(".csv") and "Building_Solutions" in f:
+                return os.path.join(root, f)
+    return None
 
 
 def load_polygons_from_csv(csv_path, target_img_id):
     """
-    Finds building footprint polygons for target_img_id inside CSV file.
+    Finds building footprint polygons for target_img_id inside SpaceNet CSV file.
+    Returns a list of polygon coordinate tuples [(x1,y1), (x2,y2), ...].
     """
-    if not os.path.exists(csv_path):
+    if not csv_path or not os.path.exists(csv_path):
         return []
 
     polygons = []
-    with open(csv_path, mode='r') as infile:
-        reader = csv.DictReader(infile)
-        for row in reader:
-            if row['ImageId'] == target_img_id:
-                pix_wkt = row['PolygonWKT_Pix']
-                if pix_wkt != 'POLYGON EMPTY':
-                    geom = wkt.loads(pix_wkt)
-                    coords = [(pt[0], pt[1]) for pt in geom.exterior.coords]
-                    polygons.append(coords)
+    normalized_target = extract_image_id_from_path(target_img_id)
+
+    try:
+        with open(csv_path, mode='r', encoding='utf-8') as infile:
+            reader = csv.DictReader(infile)
+            for row in reader:
+                img_id = row.get('ImageId', '').strip()
+                norm_row_id = extract_image_id_from_path(img_id)
+                if norm_row_id == normalized_target or img_id == target_img_id:
+                    pix_wkt = row.get('PolygonWKT_Pix', '').strip()
+                    if pix_wkt and pix_wkt != 'POLYGON EMPTY':
+                        try:
+                            geom = wkt.loads(pix_wkt)
+                            if hasattr(geom, 'exterior') and geom.exterior:
+                                coords = [(float(pt[0]), float(pt[1])) for pt in geom.exterior.coords]
+                                if len(coords) >= 3:
+                                    polygons.append(coords)
+                        except Exception:
+                            continue
+    except Exception as e:
+        print(f"[CSV Reader Notice]: {e}")
+
     return polygons
 
 
-def _is_binary_mask(image):
+def detect_buildings_from_aerial_image(image, gsd=0.30):
     """
-    Heuristic: returns True when the image looks like a binary segmentation mask
-    (only two intensity clusters: near-0 and near-255).
-    """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-    hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
-    dark = float(np.sum(hist[:30]))
-    bright = float(np.sum(hist[225:]))
-    total = float(gray.size)
-    return (dark + bright) / total > 0.80
+    Conservative, high-precision computer-vision fallback building detector.
+    Used when SpaceNet CSV annotations are unavailable (e.g. arbitrary aerial/satellite images or test images).
 
-
-def extract_building_polygons_from_png_mask(image, min_area_px=500):
-    """
-    Legacy entry-point — routes to the correct detector based on image type.
-    Binary segmentation masks use the fast threshold path; real aerial/satellite
-    photos (JPG, RGB GeoTIFF) use the full multi-strategy CV pipeline.
-    """
-    if _is_binary_mask(image):
-        # ---- Binary-mask fast path (original behaviour) -----------------------
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-        _, thresh = cv2.threshold(gray, 20, 255, cv2.THRESH_BINARY)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        polygons = []
-        for cnt in contours:
-            if cv2.contourArea(cnt) >= 15:
-                epsilon = 0.01 * cv2.arcLength(cnt, True)
-                approx = cv2.approxPolyDP(cnt, epsilon, True)
-                coords = [(float(pt[0][0]), float(pt[0][1])) for pt in approx]
-                if len(coords) >= 3:
-                    if coords[0] != coords[-1]:
-                        coords.append(coords[0])
-                    polygons.append(coords)
-        return polygons
-
-    # ---- Real aerial / satellite photo path -----------------------------------
-    return detect_buildings_from_aerial_image(image, min_area_px=min_area_px)
-
-
-def detect_buildings_from_aerial_image(image, min_area_px=None):
-    """
-    Multi-strategy, image-size-adaptive building detector for real aerial /
-    satellite photographs (JPG, RGB GeoTIFF).
-
-    Pipeline:
-      A. CLAHE-enhanced Otsu threshold   — primary detection
-      B. Adaptive threshold              — catches low-contrast rooftops
-      C. Canny edges (scale-adaptive)    — outlines for large buildings
-      D. HSV suppression of sky/veg      — removes false positives
-      Merge A+B+C, suppress D, clean up with morphology, then separate
-      touching blobs via watershed.  Filter by area, aspect, solidity.
+    Key Design Principles:
+      - Prevents false-positives over roads, vegetation, and shadows.
+      - Uses multi-pass candidate segmentation (CLAHE-Otsu, multi-quantile luminance thresholds).
+      - Applies HSV vegetation and shadow suppression masks.
+      - Evaluates strict geometric criteria: Area, Width, Aspect Ratio, Solidity, Extent, and Vertex Count.
+      - Performs Non-Maximum Suppression (NMS) to eliminate overlapping / duplicate polygons.
     """
     if image is None:
         return []
 
     img_h, img_w = image.shape[:2]
-    img_area   = img_h * img_w
-    short_side = min(img_h, img_w)
+    img_area = img_h * img_w
 
-    # ------------------------------------------------------------------ #
-    # Scale-adaptive morphological kernel sizes (proportional to image)
-    #   k_small : ~1 % of short side, minimum 3
-    #   k_close : ~3 % for edge-closing, max 21 on large images
-    # ------------------------------------------------------------------ #
-    k_small = max(3, int(short_side * 0.010) | 1)   # ensure odd
-    k_close = max(3, int(short_side * 0.025) | 1)
-    k_fill  = max(3, int(short_side * 0.015) | 1)
+    # 1. Vegetation & Shadow Masking
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    veg_mask = cv2.inRange(hsv, np.array([30, 25, 25]), np.array([85, 255, 255]))
 
-    # Adaptive min / max area bounds (scale with image resolution)
-    if min_area_px is None:
-        min_area_px = max(50, int(img_area * 0.0006))   # ≥0.06 % of image
-    max_area_px = int(img_area * 0.55)                   # ≤55 % of image
+    # Excess Green index (ExG = 2G - R - B)
+    b, g, r = cv2.split(image.astype(np.float32))
+    exg = 2.0 * g - r - b
+    exg_mask = (exg > 20.0).astype(np.uint8) * 255
+    veg_mask = cv2.bitwise_or(veg_mask, exg_mask)
 
-    # ------------------------------------------------------------------ #
-    # 0. Preprocessing
-    # ------------------------------------------------------------------ #
-    bgr = image.copy()
-    if bgr.dtype != np.uint8:
-        bgr = np.clip(bgr, 0, 255).astype(np.uint8)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    shadow_mask = (gray < 35).astype(np.uint8) * 255
 
-    blur_k = max(3, (k_small // 2) * 2 - 1)    # odd ≤ k_small
-    blurred = cv2.GaussianBlur(bgr, (blur_k, blur_k), 0.8)
-    gray    = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+    # 2. Smooth roof textures while preserving sharp building edges
+    blurred = cv2.bilateralFilter(image, 7, 50, 50)
+    blurred_gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
 
-    tile = max(4, short_side // 32)
-    clahe    = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(tile, tile))
-    enhanced = clahe.apply(gray)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(blurred_gray)
 
-    hsv  = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-    v_ch = hsv[:, :, 2]
+    # 3. Multi-Pass Roof Candidate Segmentation
+    candidate_masks = []
 
-    # ------------------------------------------------------------------ #
-    # Strategy A — Otsu on CLAHE-enhanced greyscale
-    # ------------------------------------------------------------------ #
-    _, mask_a = cv2.threshold(enhanced, 0, 255,
-                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Pass 1: Otsu on enhanced gray
+    _, m1 = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    candidate_masks.append(m1)
 
-    # ------------------------------------------------------------------ #
-    # Strategy B — Adaptive threshold (local mean) for low-contrast areas
-    # ------------------------------------------------------------------ #
-    block = max(11, (short_side // 12) | 1)   # odd, scales with image
-    mask_b = cv2.adaptiveThreshold(enhanced, 255,
-                                   cv2.ADAPTIVE_THRESH_MEAN_C,
-                                   cv2.THRESH_BINARY, block, 4)
+    # Pass 2: Otsu inverse (dark roofs)
+    _, m2 = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    candidate_masks.append(m2)
 
-    # ------------------------------------------------------------------ #
-    # Strategy C — Canny edges closed into blobs (scale-adaptive kernel)
-    # ------------------------------------------------------------------ #
-    med_val = float(np.median(enhanced))
-    canny_lo = int(max(10, med_val * 0.40))
-    canny_hi = int(min(240, med_val * 1.20))
-    edges  = cv2.Canny(enhanced, canny_lo, canny_hi)
-    close_el = cv2.getStructuringElement(cv2.MORPH_RECT, (k_close, k_close))
-    mask_c   = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_el)
+    # Pass 3: High-quantile luminance thresholding (bright roofs)
+    q65, q80 = np.percentile(enhanced, [65, 80])
+    _, m3 = cv2.threshold(enhanced, int(q65), 255, cv2.THRESH_BINARY)
+    _, m4 = cv2.threshold(enhanced, int(q80), 255, cv2.THRESH_BINARY)
+    candidate_masks.extend([m3, m4])
 
-    # ------------------------------------------------------------------ #
-    # Strategy D — HSV suppression: vegetation, sky, deep shadows
-    # ------------------------------------------------------------------ #
-    veg_mask    = cv2.inRange(hsv, np.array([30, 35, 35]),  np.array([85,  255, 255]))
-    sky_mask    = cv2.inRange(hsv, np.array([90, 15, 150]), np.array([130, 255, 255]))
-    shadow_mask = (v_ch < 35).astype(np.uint8) * 255
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
 
-    suppress = cv2.bitwise_or(veg_mask, sky_mask)
-    suppress = cv2.bitwise_or(suppress, shadow_mask)
-    sup_el   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_small, k_small))
-    suppress = cv2.dilate(suppress, sup_el)
+    min_area_m2 = 15.0
+    max_area_m2 = min(3500.0, (img_area * (gsd ** 2)) * 0.15)  # <= 15% of image area
 
-    # ------------------------------------------------------------------ #
-    # Merge A + B + C, then suppress D
-    # ------------------------------------------------------------------ #
-    combined = cv2.bitwise_or(mask_a, mask_b)
-    combined = cv2.bitwise_or(combined, mask_c)
-    combined = cv2.bitwise_and(combined, cv2.bitwise_not(suppress))
+    all_candidates = []
 
-    # ------------------------------------------------------------------ #
-    # Morphological cleanup
-    # ------------------------------------------------------------------ #
-    fill_el = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_fill, k_fill))
-    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, fill_el)
-    open_el  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_small, k_small))
-    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN,  open_el)
+    for mask in candidate_masks:
+        # Morphological cleanup
+        m = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel_close)
+        m[veg_mask > 0] = 0
+        m[shadow_mask > 0] = 0
 
-    # ------------------------------------------------------------------ #
-    # Watershed separation of touching blobs
-    # ------------------------------------------------------------------ #
-    dist      = cv2.distanceTransform(combined, cv2.DIST_L2, 5)
-    dist_norm = cv2.normalize(dist, None, 0, 1.0, cv2.NORM_MINMAX)
-
-    fg_thresh = 0.35   # pixels clearly inside a building
-    _, sure_fg = cv2.threshold(dist_norm, fg_thresh, 1.0, cv2.THRESH_BINARY)
-    sure_fg    = (sure_fg * 255).astype(np.uint8)
-
-    sure_bg = cv2.dilate(combined,
-                         cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-                         iterations=3)
-    unknown = cv2.subtract(sure_bg, sure_fg)
-
-    n_labels, markers = cv2.connectedComponents(sure_fg)
-    markers = markers + 1
-    markers[unknown == 255] = 0
-
-    ws_input = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-    cv2.watershed(ws_input, markers)
-
-    # ------------------------------------------------------------------ #
-    # Helper: validate & convert a single contour to polygon coords
-    # ------------------------------------------------------------------ #
-    def _contour_to_polygon(cnt):
-        area = cv2.contourArea(cnt)
-        if area < min_area_px or area > max_area_px:
-            return None
-        rect   = cv2.minAreaRect(cnt)
-        s1, s2 = rect[1]
-        if min(s1, s2) < 2:
-            return None
-        if max(s1, s2) / min(s1, s2) > 25.0:
-            return None
-        hull      = cv2.convexHull(cnt)
-        hull_area = cv2.contourArea(hull)
-        if hull_area < 1 or area / hull_area < 0.28:
-            return None
-        eps    = 0.012 * cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, eps, True)
-        coords = [(float(p[0][0]), float(p[0][1])) for p in approx]
-        if len(coords) < 3:
-            return None
-        if coords[0] != coords[-1]:
-            coords.append(coords[0])
-        return coords
-
-    # ------------------------------------------------------------------ #
-    # Extract one polygon per watershed label
-    # ------------------------------------------------------------------ #
-    polygons = []
-    for label in range(2, n_labels + 1):
-        lmask = np.where(markers == label, 255, 0).astype(np.uint8)
-        cnts, _ = cv2.findContours(lmask, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
+        cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in cnts:
-            poly = _contour_to_polygon(cnt)
-            if poly:
-                polygons.append(poly)
+            area_px = cv2.contourArea(cnt)
+            area_m2 = area_px * (gsd ** 2)
 
-    # ------------------------------------------------------------------ #
-    # Fallback: direct contours from combined mask (no watershed)
-    # ------------------------------------------------------------------ #
-    if not polygons:
-        cnts, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-        for cnt in cnts:
-            poly = _contour_to_polygon(cnt)
-            if poly:
-                polygons.append(poly)
+            if area_m2 < min_area_m2 or area_m2 > max_area_m2:
+                continue
 
-    # ------------------------------------------------------------------ #
-    # Additional pass: also try contours on the raw Otsu mask alone
-    # (catches buildings missed when combined mask over-merged regions)
-    # ------------------------------------------------------------------ #
-    seen_centers = set()
-    for poly in polygons:
-        pts = np.array(poly, dtype=np.float32)
-        cx, cy = int(pts[:, 0].mean()), int(pts[:, 1].mean())
-        seen_centers.add((cx // 10, cy // 10))
+            # Convex hull & Solidity (buildings are solid shapes)
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            if hull_area <= 0:
+                continue
+            solidity = area_px / hull_area
+            if solidity < 0.70:
+                continue
 
-    fill_a = cv2.morphologyEx(mask_a, cv2.MORPH_CLOSE, fill_el)
-    fill_a = cv2.morphologyEx(fill_a, cv2.MORPH_OPEN,  open_el)
-    extra_cnts, _ = cv2.findContours(fill_a, cv2.RETR_EXTERNAL,
-                                     cv2.CHAIN_APPROX_SIMPLE)
-    for cnt in extra_cnts:
-        poly = _contour_to_polygon(cnt)
-        if poly:
-            pts = np.array(poly, dtype=np.float32)
-            cx, cy = int(pts[:, 0].mean()), int(pts[:, 1].mean())
-            key = (cx // 10, cy // 10)
-            if key not in seen_centers:
-                seen_centers.add(key)
-                polygons.append(poly)
+            # Minimum area bounding box
+            rect = cv2.minAreaRect(cnt)
+            s1, s2 = rect[1]
+            l_m = max(s1, s2) * gsd
+            w_m = min(s1, s2) * gsd
+            if w_m < 2.5:  # Reject structures thinner than 2.5 meters
+                continue
 
-    print(f"[Detector]: Found {len(polygons)} building regions "
-          f"(min={min_area_px} px², max={max_area_px} px²)")
-    return polygons
+            aspect_ratio = l_m / max(0.1, w_m)
+            if aspect_ratio > 4.5:  # Reject long ribbon structures (roads, fences)
+                continue
+
+            extent = area_px / max(1.0, s1 * s2)
+            if extent < 0.45:  # Reject low rectangularity noise
+                continue
+
+            # Polygon approximation
+            eps = 0.018 * cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, eps, True)
+            coords = [(float(p[0][0]), float(p[0][1])) for p in approx]
+            if len(coords) < 4 or len(coords) > 12:
+                continue
+
+            # Vegetation check inside candidate polygon
+            c_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+            cv2.fillPoly(c_mask, [np.int32(coords)], 255)
+            veg_in_poly = np.count_nonzero(veg_mask[c_mask == 255])
+            total_poly_px = np.count_nonzero(c_mask == 255)
+            if total_poly_px == 0:
+                continue
+            veg_ratio = veg_in_poly / float(total_poly_px)
+            if veg_ratio > 0.20:
+                continue
+
+            # Quality Score for ranking candidates in NMS
+            score = solidity * extent * (1.0 - veg_ratio)
+            try:
+                poly_geom = Polygon(coords)
+                if poly_geom.is_valid and poly_geom.area > 0:
+                    all_candidates.append((poly_geom, coords, area_m2, l_m, w_m, score))
+            except Exception:
+                pass
+
+    # 4. Non-Maximum Suppression (NMS) to eliminate duplicate/overlapping detections
+    all_candidates.sort(key=lambda x: x[5], reverse=True)
+    final_polygons = []
+
+    for cand in all_candidates:
+        p_geom, coords, area_m2, l_m, w_m, score = cand
+        overlap = False
+        for f_geom, _, _, _, _, _ in final_polygons:
+            try:
+                inter_area = p_geom.intersection(f_geom).area
+                union_area = p_geom.union(f_geom).area
+                iou = inter_area / union_area if union_area > 0 else 0
+                if iou > 0.30 or inter_area / p_geom.area > 0.50:
+                    overlap = True
+                    break
+            except Exception:
+                pass
+        if not overlap:
+            final_polygons.append(cand)
+
+    output_coords = [cand[1] for cand in final_polygons]
+    print(f"[Fallback CV Detector]: Found {len(output_coords)} high-confidence building footprints.")
+    return output_coords
 
 
 def load_building_data(csv_path, default_img_dir, selected_img_path=None):
     """
     Dynamically loads image and building footprints based on user selection or defaults.
+    Prioritizes SpaceNet ground-truth CSV annotations when available.
     """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    valid_csv_path = find_csv_file(csv_path, script_dir)
+
     image = None
     polygons = []
     img_id = "Custom_Image"
+    is_spacenet_gt = False
 
     if selected_img_path and os.path.exists(selected_img_path):
         img_path = selected_img_path
         img_id = extract_image_id_from_path(img_path)
         image = load_image_file(img_path)
-        
-        # Try loading WKT footprints from CSV
-        polygons = load_polygons_from_csv(csv_path, img_id)
+
+        # 1. Try loading ground-truth footprints from SpaceNet CSV
+        if valid_csv_path:
+            polygons = load_polygons_from_csv(valid_csv_path, img_id)
+            if polygons:
+                is_spacenet_gt = True
+                print(f"[SpaceNet GT]: Loaded {len(polygons)} ground-truth polygons from CSV for '{img_id}'.")
+
+        # 2. Fallback to conservative CV detector if CSV entry is not present
         if not polygons:
-            # Fallback to contour extraction if CSV entry not found
-            print(f"[Notice]: No CSV footprint entry found for ID '{img_id}'. Extracting contours automatically...")
-            polygons = extract_building_polygons_from_png_mask(image)
+            print(f"[Notice]: No CSV footprint entry found for ID '{img_id}'. Running computer-vision building detector...")
+            ext = os.path.splitext(img_path)[1].lower()
+            gsd = 0.30 if ext in ['.tif', '.tiff'] else 0.50
+            polygons = detect_buildings_from_aerial_image(image, gsd=gsd)
 
-        return image, polygons, img_path, img_id
+        return image, polygons, img_path, img_id, is_spacenet_gt
 
-    # Fallback default: find an image in default_img_dir with at least 5 buildings
-    if os.path.exists(csv_path):
+    # Default fallback: find a SpaceNet image with GT annotations in default_img_dir
+    if valid_csv_path:
         image_polygons = {}
-        with open(csv_path, mode='r') as infile:
+        with open(valid_csv_path, mode='r', encoding='utf-8') as infile:
             reader = csv.DictReader(infile)
             for row in reader:
-                i_id = row['ImageId']
-                pix_wkt = row['PolygonWKT_Pix']
-                if pix_wkt != 'POLYGON EMPTY':
-                    geom = wkt.loads(pix_wkt)
-                    coords = [(pt[0], pt[1]) for pt in geom.exterior.coords]
-                    if i_id not in image_polygons:
-                        image_polygons[i_id] = []
-                    image_polygons[i_id].append(coords)
+                i_id = row.get('ImageId', '').strip()
+                pix_wkt = row.get('PolygonWKT_Pix', '').strip()
+                if pix_wkt and pix_wkt != 'POLYGON EMPTY':
+                    try:
+                        geom = wkt.loads(pix_wkt)
+                        if hasattr(geom, 'exterior') and geom.exterior:
+                            coords = [(float(pt[0]), float(pt[1])) for pt in geom.exterior.coords]
+                            if i_id not in image_polygons:
+                                image_polygons[i_id] = []
+                            image_polygons[i_id].append(coords)
+                    except Exception:
+                        continue
 
         for i_id, polys in image_polygons.items():
             if len(polys) >= 5:
                 img_id = i_id
                 polygons = polys
+                is_spacenet_gt = True
                 break
 
-    # Look for candidate file matching default img_id
     img_path = None
     for ext in ['.tif', '.tiff', '.png', '.jpg', '.jpeg']:
         cand = os.path.join(default_img_dir, f"RGB-PanSharpen_{img_id}{ext}")
@@ -408,98 +403,144 @@ def load_building_data(csv_path, default_img_dir, selected_img_path=None):
         if files:
             img_path = files[0]
             img_id = extract_image_id_from_path(img_path)
-            polygons = load_polygons_from_csv(csv_path, img_id)
+            if valid_csv_path:
+                polygons = load_polygons_from_csv(valid_csv_path, img_id)
+                if polygons:
+                    is_spacenet_gt = True
 
     if img_path is None or not os.path.exists(img_path):
         raise FileNotFoundError("No satellite image file found. Please select a valid .tif or .png image.")
 
     image = load_image_file(img_path)
     if not polygons:
-        polygons = extract_building_polygons_from_png_mask(image)
+        ext = os.path.splitext(img_path)[1].lower()
+        gsd = 0.30 if ext in ['.tif', '.tiff'] else 0.50
+        polygons = detect_buildings_from_aerial_image(image, gsd=gsd)
 
-    return image, polygons, img_path, img_id
-
-
-def estimate_shadow_length(gray_image, polygon_coords, solar_azimuth_deg=135.0, max_search_px=50):
-    """
-    Highly optimized shadow length estimator using localized sub-image cropping
-    and geospatial solar vector math.
-    """
-    if gray_image is None or len(polygon_coords) < 3:
-        return 0.0
-
-    h_img, w_img = gray_image.shape[:2]
-
-    # Geospatial Solar Vector Math (Azimuth measured clockwise from North)
-    rad = math.radians(solar_azimuth_deg)
-    dx_shadow = -math.sin(rad)
-    dy_shadow = math.cos(rad)
-
-    pts_arr = np.array(polygon_coords, dtype=np.float32)
-    min_x = max(0, int(np.min(pts_arr[:, 0])) - max_search_px)
-    max_x = min(w_img, int(np.max(pts_arr[:, 0])) + max_search_px)
-    min_y = max(0, int(np.min(pts_arr[:, 1])) - max_search_px)
-    max_y = min(h_img, int(np.max(pts_arr[:, 1])) + max_search_px)
-
-    crop_gray = gray_image[min_y:max_y, min_x:max_x]
-    crop_h, crop_w = crop_gray.shape[:2]
-
-    if crop_h <= 0 or crop_w <= 0:
-        return 0.0
-
-    local_pts = pts_arr - np.array([min_x, min_y], dtype=np.float32)
-    int_local_pts = np.int32(local_pts)
-
-    local_mask = np.zeros((crop_h, crop_w), dtype=np.uint8)
-    cv2.fillPoly(local_mask, [int_local_pts], 255)
-
-    roof_pixels = crop_gray[local_mask == 255]
-    if len(roof_pixels) == 0:
-        return 0.0
-
-    mean_roof_val = np.mean(roof_pixels)
-    shadow_threshold = min(mean_roof_val * 0.72, 105.0)
-
-    shadow_lengths = []
-    step_stride = max(1, len(local_pts) // 16)
-    for pt in local_pts[::step_stride]:
-        x0, y0 = pt[0], pt[1]
-        length = 0
-        for step in range(1, max_search_px):
-            sx = int(round(x0 + dx_shadow * step))
-            sy = int(round(y0 + dy_shadow * step))
-            if 0 <= sx < crop_w and 0 <= sy < crop_h:
-                if local_mask[sy, sx] == 255:
-                    continue
-                val = crop_gray[sy, sx]
-                if val < shadow_threshold:
-                    length = step
-                else:
-                    if length > 0:
-                        break
-            else:
-                break
-        if length > 0:
-            shadow_lengths.append(length)
-
-    if shadow_lengths:
-        return float(np.percentile(shadow_lengths, 75))
-    return 0.0
+    return image, polygons, img_path, img_id, is_spacenet_gt
 
 
-def calculate_building_dimensions(
-    polygon_coords, 
-    gray_image=None,
-    gsd_meters_per_pixel=0.30, 
-    solar_elevation_deg=52.0, 
+def estimate_shadow_length_and_height(
+    gray_image,
+    polygon_coords,
+    gsd_meters_per_pixel=0.30,
+    solar_elevation_deg=52.0,
     solar_azimuth_deg=135.0,
     floor_height_m=3.0
 ):
     """
-    Computes accurate 3D building dimensions: Length, Width, Height, Floor Count, and Volume.
+    Robust shadow-based building height calculator.
+    Measures dark connected shadow regions adjacent to the sun-facing building perimeter.
+    Only returns shadow-based height when a valid shadow is physically detected.
+    """
+    if gray_image is None or len(polygon_coords) < 3:
+        return {
+            'shadow_px': 0.0,
+            'shadow_m': 0.0,
+            'height_m': 6.0,
+            'floors': 2,
+            'shadow_valid': False,
+            'source': 'Nominal Estimate (No shadow detected)'
+        }
+
+    h_img, w_img = gray_image.shape[:2]
+
+    # Solar shadow direction vector (azimuth clockwise from North)
+    rad_az = math.radians(solar_azimuth_deg)
+    dx_shadow = -math.sin(rad_az)
+    dy_shadow = math.cos(rad_az)
+
+    pts = np.array(polygon_coords, dtype=np.int32)
+    roof_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+    cv2.fillPoly(roof_mask, [pts], 255)
+
+    roof_pixels = gray_image[roof_mask == 255]
+    if len(roof_pixels) == 0:
+        return {
+            'shadow_px': 0.0,
+            'shadow_m': 0.0,
+            'height_m': 6.0,
+            'floors': 2,
+            'shadow_valid': False,
+            'source': 'Nominal Estimate (No roof pixels)'
+        }
+
+    mean_roof_val = float(np.mean(roof_pixels))
+    # Shadows must be significantly darker than the roof surface
+    shadow_threshold = min(mean_roof_val * 0.65, 70.0)
+
+    ray_lengths = []
+    max_search_px = 50
+
+    step_stride = max(1, len(pts) // 16)
+    for pt in pts[::step_stride]:
+        x0, y0 = float(pt[0]), float(pt[1])
+        length = 0
+        for step in range(1, max_search_px):
+            sx = int(round(x0 + dx_shadow * step))
+            sy = int(round(y0 + dy_shadow * step))
+            if 0 <= sx < w_img and 0 <= sy < h_img:
+                if roof_mask[sy, sx] == 255:
+                    continue  # Stay outside building roof
+                val = gray_image[sy, sx]
+                if val < shadow_threshold:
+                    length = step
+                else:
+                    if length > 0:
+                        break  # Shadow ended
+            else:
+                break
+        if length >= 3:  # Must be at least 3 pixels to count as valid shadow
+            ray_lengths.append(length)
+
+    if len(ray_lengths) >= 3:
+        shadow_px = float(np.median(ray_lengths))
+        shadow_m = shadow_px * gsd_meters_per_pixel
+        elevation_rad = math.radians(solar_elevation_deg)
+        height_m = shadow_m * math.tan(elevation_rad)
+        height_m = max(2.5, min(height_m, 60.0))  # Sanity clamp (2.5m - 60m)
+        floors = max(1, int(round(height_m / floor_height_m)))
+        return {
+            'shadow_px': shadow_px,
+            'shadow_m': shadow_m,
+            'height_m': height_m,
+            'floors': floors,
+            'shadow_valid': True,
+            'source': 'Shadow Measurement'
+        }
+
+    # Nominal fallback estimate when no shadow is clearly visible
+    height_m = 6.0
+    floors = 2
+    return {
+        'shadow_px': 0.0,
+        'shadow_m': 0.0,
+        'height_m': height_m,
+        'floors': floors,
+        'shadow_valid': False,
+        'source': 'Nominal Estimate (No shadow detected)'
+    }
+
+
+def calculate_building_dimensions(
+    polygon_coords,
+    gray_image=None,
+    gsd_meters_per_pixel=0.30,
+    solar_elevation_deg=52.0,
+    solar_azimuth_deg=135.0,
+    floor_height_m=3.0,
+    is_spacenet_gt=False
+):
+    """
+    Computes accurate building dimensions & confidence scores:
+      - Footprint Area (m²) from actual polygon
+      - Oriented Bounding Box Length & Width (m)
+      - Shadow-based or Nominal Height (m), Floor Count, and Volume (m³)
+      - Confidence Rating: High / Medium / Low
     """
     pts = np.array(polygon_coords, dtype=np.float32).reshape((-1, 1, 2))
 
+    # Oriented Bounding Box (cv2.minAreaRect)
     rect = cv2.minAreaRect(pts)
     center, (side1, side2), angle = rect
 
@@ -509,6 +550,7 @@ def calculate_building_dimensions(
     length_m = length_px * gsd_meters_per_pixel
     width_m = width_px * gsd_meters_per_pixel
 
+    # Actual Polygon Area
     polygon = Polygon(polygon_coords)
     area_px = polygon.area
     area_m = area_px * (gsd_meters_per_pixel ** 2)
@@ -516,27 +558,39 @@ def calculate_building_dimensions(
     box_pts = cv2.boxPoints(rect)
     box_pts = np.int32(box_pts)
 
-    shadow_px = estimate_shadow_length(
-        gray_image, 
-        polygon_coords, 
-        solar_azimuth_deg=solar_azimuth_deg
+    # Height estimation via shadow analysis
+    shadow_info = estimate_shadow_length_and_height(
+        gray_image,
+        polygon_coords,
+        gsd_meters_per_pixel=gsd_meters_per_pixel,
+        solar_elevation_deg=solar_elevation_deg,
+        solar_azimuth_deg=solar_azimuth_deg,
+        floor_height_m=floor_height_m
     )
-    shadow_m = shadow_px * gsd_meters_per_pixel
-    elevation_rad = math.radians(solar_elevation_deg)
-    height_shadow_m = shadow_m * math.tan(elevation_rad) if shadow_px > 0 else 0.0
 
-    aspect_ratio = length_m / max(width_m, 0.1)
-    base_floors = max(1.0, 0.82 * math.pow(area_m, 0.33) + 0.25 * aspect_ratio)
-    height_structural_m = base_floors * floor_height_m
-
-    if height_shadow_m > 2.0:
-        height_m = 0.60 * height_shadow_m + 0.40 * height_structural_m
-    else:
-        height_m = height_structural_m
-
+    height_m = shadow_info['height_m']
     height_px = height_m / gsd_meters_per_pixel
-    floors = max(1, int(round(height_m / floor_height_m)))
+    floors = shadow_info['floors']
     volume_m3 = area_m * height_m
+
+    # Compute Solidity for confidence assessment
+    hull = cv2.convexHull(pts)
+    hull_area = cv2.contourArea(hull)
+    solidity = area_px / max(1.0, hull_area)
+
+    # Assign Confidence Rating
+    if is_spacenet_gt:
+        if shadow_info['shadow_valid']:
+            confidence = "High"
+        else:
+            confidence = "High" if area_m >= 30.0 else "Medium"
+    else:
+        if shadow_info['shadow_valid'] and solidity >= 0.75:
+            confidence = "High"
+        elif solidity >= 0.70:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
 
     return {
         'rect': rect,
@@ -550,7 +604,11 @@ def calculate_building_dimensions(
         'height_m': height_m,
         'floors': floors,
         'volume_m3': volume_m3,
-        'shadow_px': shadow_px,
+        'shadow_px': shadow_info['shadow_px'],
+        'shadow_m': shadow_info['shadow_m'],
+        'shadow_valid': shadow_info['shadow_valid'],
+        'height_source': shadow_info['source'],
+        'confidence': confidence,
         'area_px': area_px,
         'area_m': area_m,
         'angle': angle
@@ -558,26 +616,30 @@ def calculate_building_dimensions(
 
 
 def draw_building_measurements(
-    image, 
-    polygon_coords, 
-    measurement_info, 
+    image,
+    polygon_coords,
+    measurement_info,
     building_index=1,
     draw_3d_wireframe=True
 ):
     """
-    Renders 2D footprint, oriented bounding box, 3D wireframe extrusions, and text cards.
+    Renders visualization elements:
+      - Green: 2D Building Ground Footprint Polygon
+      - Cyan: Oriented Bounding Box
+      - Magenta: 3D Wireframe Extrusion
+      - Crisp label card displaying Index, L x W x H, Floors, and Confidence Rating.
     """
     annotated = image.copy()
-    
-    # 2D Ground Footprint Polygon (Green)
+
+    # 1. Ground Footprint Polygon (Green)
     poly_pts = np.array(polygon_coords, dtype=np.int32).reshape((-1, 1, 2))
     cv2.polylines(annotated, [poly_pts], isClosed=True, color=(0, 255, 0), thickness=2)
 
-    # Minimum Area Bounding Box (Cyan)
+    # 2. Minimum Area Oriented Bounding Box (Cyan)
     box_pts = measurement_info['box_points']
     cv2.polylines(annotated, [box_pts], isClosed=True, color=(255, 255, 0), thickness=2)
 
-    # 3D Wireframe Extrusion Projection (Magenta & Hot Pink)
+    # 3. 3D Wireframe Extrusion (Magenta & Hot Pink)
     if draw_3d_wireframe:
         height_px = measurement_info['height_px']
         offset_x = int(round(-0.45 * height_px))
@@ -587,55 +649,76 @@ def draw_building_measurements(
 
         for pt_ground, pt_top in zip(box_pts, top_box_pts):
             cv2.line(
-                annotated, 
-                tuple(pt_ground), 
-                tuple(pt_top), 
-                color=(255, 0, 255), 
-                thickness=1, 
+                annotated,
+                tuple(pt_ground),
+                tuple(pt_top),
+                color=(255, 0, 255),
+                thickness=1,
                 lineType=cv2.LINE_AA
             )
 
         cv2.polylines(
-            annotated, 
-            [top_box_pts], 
-            isClosed=True, 
-            color=(255, 105, 180), 
-            thickness=2, 
+            annotated,
+            [top_box_pts],
+            isClosed=True,
+            color=(255, 105, 180),
+            thickness=2,
             lineType=cv2.LINE_AA
         )
 
+    # 4. Text Overlay Card
     l_m = measurement_info['length_m']
     w_m = measurement_info['width_m']
     h_m = measurement_info['height_m']
     fl = measurement_info['floors']
+    conf = measurement_info['confidence']
 
-    label_str = f"B{building_index}: {l_m:.1f}m x {w_m:.1f}m x {h_m:.1f}m H ({fl}Fl)"
+    label_line1 = f"B{building_index}: {l_m:.1f}m x {w_m:.1f}m x {h_m:.1f}m H ({fl}Fl)"
+    label_line2 = f"Conf: {conf}"
 
     cx, cy = measurement_info['center']
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.42
+    font_scale = 0.40
     thickness = 1
-    (text_w, text_h), baseline = cv2.getTextSize(label_str, font, font_scale, thickness)
-    
-    text_x = max(5, cx - text_w // 2)
-    text_y = max(18, cy - 8)
 
+    (text_w1, text_h1), _ = cv2.getTextSize(label_line1, font, font_scale, thickness)
+    (text_w2, text_h2), _ = cv2.getTextSize(label_line2, font, font_scale, thickness)
+
+    card_w = max(text_w1, text_w2) + 8
+    card_h = text_h1 + text_h2 + 10
+
+    text_x = max(5, cx - card_w // 2)
+    text_y = max(card_h + 5, cy - 10)
+
+    # Dark background box
     cv2.rectangle(
-        annotated, 
-        (text_x - 3, text_y - text_h - 4), 
-        (text_x + text_w + 3, text_y + baseline + 2), 
-        (0, 0, 0), 
+        annotated,
+        (text_x - 3, text_y - card_h + 2),
+        (text_x + card_w, text_y + 4),
+        (0, 0, 0),
         -1
     )
-    
+
     cv2.putText(
-        annotated, 
-        label_str, 
-        (text_x, text_y), 
-        font, 
-        font_scale, 
-        (255, 255, 255), 
-        thickness, 
+        annotated,
+        label_line1,
+        (text_x, text_y - text_h2 - 4),
+        font,
+        font_scale,
+        (255, 255, 255),
+        thickness,
+        lineType=cv2.LINE_AA
+    )
+
+    conf_color = (0, 255, 0) if conf == "High" else ((0, 255, 255) if conf == "Medium" else (0, 165, 255))
+    cv2.putText(
+        annotated,
+        label_line2,
+        (text_x, text_y),
+        font,
+        font_scale,
+        conf_color,
+        thickness,
         lineType=cv2.LINE_AA
     )
 
@@ -661,7 +744,7 @@ def main():
     parser.add_argument("--no-gui", action="store_true",       help="Disable GUI file selection dialog")
     parser.add_argument("--gsd",    type=float, default=None,
                         help="Ground sample distance in metres/pixel. "
-                             "Default: 0.30 for TIFF, 0.50 auto-estimated for JPG/PNG.")
+                             "Default: 0.30 for TIFF (SpaceNet 2), 0.50 auto-estimated for JPG/PNG.")
     args = parser.parse_args()
 
     start_total_time = time.perf_counter()
@@ -673,7 +756,7 @@ def main():
     base_dir = os.path.join(script_dir, r"dataset\AOI_3_Paris_Train\AOI_3_Paris_Train")
     csv_path = os.path.join(base_dir, r"summaryData\AOI_3_Paris_Train_Building_Solutions.csv")
     img_dir = os.path.join(base_dir, r"RGB-PanSharpen")
-    
+
     selected_img_path = args.image
 
     # Open Windows File Dialog if no direct image argument is provided and GUI is enabled
@@ -696,9 +779,13 @@ def main():
     print("==================================================")
 
     t0 = time.perf_counter()
-    image, polygons, img_path, img_id = load_building_data(csv_path, img_dir, selected_img_path=selected_img_path)
+    image, polygons, img_path, img_id, is_spacenet_gt = load_building_data(
+        csv_path, img_dir, selected_img_path=selected_img_path
+    )
     t_load = (time.perf_counter() - t0) * 1000
+    footprint_source_str = "SpaceNet Ground-Truth CSV" if is_spacenet_gt else "Computer Vision Fallback"
     print(f"[Loaded Image & Polygons in {t_load:.1f}ms]: {os.path.basename(img_path)} (ID: {img_id})")
+    print(f"[Footprint Source]: {footprint_source_str}")
     print(f"[Building Count]: {len(polygons)} building footprints found.")
 
     save_image(original_sat_path, image)
@@ -706,16 +793,15 @@ def main():
 
     gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # ---- Resolve Ground Sample Distance ----------------------------------------
+    # Ground Sample Distance (GSD) resolution
     ext_lower = os.path.splitext(img_path)[1].lower()
     if args.gsd is not None:
         gsd = args.gsd
         print(f"[GSD]: Using user-specified {gsd:.4f} m/px")
     elif ext_lower in ('.tif', '.tiff'):
         gsd = 0.30          # SpaceNet 2 GeoTIFF native resolution
-        print(f"[GSD]: TIFF image detected — using {gsd:.2f} m/px (SpaceNet default)")
+        print(f"[GSD]: GeoTIFF image detected — using native {gsd:.2f} m/px (SpaceNet 2 standard)")
     else:
-        # Heuristic for aerial JPG: larger images → higher altitude → coarser GSD
         img_h, img_w = image.shape[:2]
         mp = (img_h * img_w) / 1_000_000.0
         if mp >= 8:
@@ -726,8 +812,7 @@ def main():
             gsd = 0.50
         else:
             gsd = 0.30
-        print(f"[GSD]: JPG image ({img_h}x{img_w}, {mp:.1f} MP) — "
-              f"auto-estimated {gsd:.2f} m/px. Override with --gsd <value>.")
+        print(f"[GSD]: Aerial image ({img_h}x{img_w}, {mp:.1f} MP) — auto-estimated {gsd:.2f} m/px.")
 
     footprints_img = image.copy()
     for poly in polygons:
@@ -747,21 +832,23 @@ def main():
             gsd_meters_per_pixel=gsd,
             solar_elevation_deg=52.0,
             solar_azimuth_deg=135.0,
-            floor_height_m=3.0
+            floor_height_m=3.0,
+            is_spacenet_gt=is_spacenet_gt
         )
-        
+
         if dim['area_m'] < 1.0:
             continue
 
         building_metrics.append(dim)
 
         print(f"Building #{idx}:")
-        print(f"  Length   : {dim['length_px']:.2f} px  -> {dim['length_m']:.2f} m")
-        print(f"  Width    : {dim['width_px']:.2f} px  -> {dim['width_m']:.2f} m")
-        print(f"  Height   : {dim['height_px']:.2f} px  -> {dim['height_m']:.2f} m ({dim['floors']} Floors)")
-        print(f"  Footprint: {dim['area_px']:.2f} px² -> {dim['area_m']:.2f} m²")
-        print(f"  3D Volume: {dim['volume_m3']:.2f} m³")
-        print("  " + "-" * 40)
+        print(f"  Confidence : {dim['confidence']} ({dim['height_source']})")
+        print(f"  Footprint  : {dim['area_px']:.2f} px² -> {dim['area_m']:.2f} m² (actual polygon area)")
+        print(f"  Length     : {dim['length_px']:.2f} px  -> {dim['length_m']:.2f} m (oriented bbox length)")
+        print(f"  Width      : {dim['width_px']:.2f} px  -> {dim['width_m']:.2f} m (oriented bbox width)")
+        print(f"  Height     : {dim['height_px']:.2f} px  -> {dim['height_m']:.2f} m ({dim['floors']} Floors)")
+        print(f"  3D Volume  : {dim['volume_m3']:.2f} m³")
+        print("  " + "-" * 45)
 
         annotated_img = draw_building_measurements(
             annotated_img,
@@ -777,6 +864,7 @@ def main():
     save_image(output_path, annotated_img)
     print(f"[Saved Annotated Output Image]: {output_path}")
 
+    # 4-Panel Analytics Plot
     fig, axes = plt.subplots(2, 2, figsize=(18, 14))
 
     axes[0, 0].imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
@@ -784,7 +872,7 @@ def main():
     axes[0, 0].axis("off")
 
     axes[0, 1].imshow(cv2.cvtColor(footprints_img, cv2.COLOR_BGR2RGB))
-    axes[0, 1].set_title(f"2. Building Ground Footprints\n(Green Polygons)", fontsize=12, fontweight='bold')
+    axes[0, 1].set_title(f"2. Building Ground Footprints ({len(polygons)})\nSource: {footprint_source_str}", fontsize=12, fontweight='bold')
     axes[0, 1].axis("off")
 
     axes[1, 0].imshow(cv2.cvtColor(annotated_img, cv2.COLOR_BGR2RGB))
@@ -799,26 +887,27 @@ def main():
     color_h = '#1f77b4'
     color_v = '#ff7f0e'
 
-    bars = ax_bar.bar(indices - 0.2, heights, width=0.4, color=color_h, align='center', label='Height (m)')
-    ax_bar.set_xlabel('Building Index (#)', fontsize=11, fontweight='bold')
-    ax_bar.set_ylabel('Height (meters)', color=color_h, fontsize=11, fontweight='bold')
-    ax_bar.tick_params(axis='y', labelcolor=color_h)
-    ax_bar.set_xticks(indices)
-    ax_bar.grid(True, linestyle='--', alpha=0.5)
+    if len(building_metrics) > 0:
+        ax_bar.bar(indices - 0.2, heights, width=0.4, color=color_h, align='center', label='Height (m)')
+        ax_bar.set_xlabel('Building Index (#)', fontsize=11, fontweight='bold')
+        ax_bar.set_ylabel('Height (meters)', color=color_h, fontsize=11, fontweight='bold')
+        ax_bar.tick_params(axis='y', labelcolor=color_h)
+        ax_bar.set_xticks(indices)
+        ax_bar.grid(True, linestyle='--', alpha=0.5)
 
-    ax_vol = ax_bar.twinx()
-    ax_vol.plot(indices, volumes, color=color_v, marker='o', linewidth=2, label='Volume (m³)')
-    ax_vol.set_ylabel('3D Volume (m³)', color=color_v, fontsize=11, fontweight='bold')
-    ax_vol.tick_params(axis='y', labelcolor=color_v)
-
-    ax_bar.set_title("4. Building Heights & 3D Volume Distribution", fontsize=12, fontweight='bold')
+        ax_vol = ax_bar.twinx()
+        ax_vol.plot(indices, volumes, color=color_v, marker='o', linewidth=2, label='Volume (m³)')
+        ax_vol.set_ylabel('3D Volume (m³)', color=color_v, fontsize=11, fontweight='bold')
+        ax_vol.tick_params(axis='y', labelcolor=color_v)
+        ax_bar.set_title("4. Building Heights & 3D Volume Distribution", fontsize=12, fontweight='bold')
 
     plt.tight_layout()
     plt.savefig(plot_path, dpi=300)
     print(f"[Saved Multi-Panel Analytics Plot]: {plot_path}")
-    
+
     total_time_ms = (time.perf_counter() - start_total_time) * 1000
     print(f"\nExecution completed successfully in {total_time_ms:.1f}ms!")
+
 
 if __name__ == '__main__':
     main()
